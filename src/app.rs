@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::{
@@ -26,6 +28,7 @@ pub(crate) struct AppState {
     search_input: String,
     search_match_line_indexes: Vec<usize>,
     search_match_index: Option<usize>,
+    pub(crate) focused_hunk_lines: Option<HashSet<usize>>,
 }
 
 impl AppState {
@@ -51,6 +54,7 @@ impl AppState {
             search_input: String::new(),
             search_match_line_indexes: Vec::new(),
             search_match_index: None,
+            focused_hunk_lines: None,
         }
     }
 
@@ -146,6 +150,52 @@ impl AppState {
         }
     }
 
+    fn jump_to_hunk(&mut self, files: &[DiffFileView], rows: u16, forward: bool) {
+        let hunk_starts = build_hunk_start_lines(&files[self.file_index]);
+
+        let target = if forward {
+            hunk_starts
+                .iter()
+                .find(|&&line| line > self.scroll_offset)
+        } else {
+            hunk_starts
+                .iter()
+                .rev()
+                .find(|&&line| line < self.scroll_offset)
+        };
+
+        if let Some(&line) = target {
+            let max_scroll = max_scroll_for_current_file(files, self, rows);
+            self.scroll_offset = line.min(max_scroll);
+            self.focused_hunk_lines =
+                Some(build_hunk_line_range(&files[self.file_index], line));
+            return;
+        }
+
+        // Cross-file wrap: advance to next/prev file and jump to its first/last hunk
+        let moved = if forward {
+            move_file(1, files, self)
+        } else {
+            move_file(-1, files, self)
+        };
+
+        if moved {
+            self.refresh_search_matches_for_current_file(files);
+            let new_hunk_starts = build_hunk_start_lines(&files[self.file_index]);
+            let wrap_target = if forward {
+                new_hunk_starts.first()
+            } else {
+                new_hunk_starts.last()
+            };
+            if let Some(&line) = wrap_target {
+                let max_scroll = max_scroll_for_current_file(files, self, rows);
+                self.scroll_offset = line.min(max_scroll);
+                self.focused_hunk_lines =
+                    Some(build_hunk_line_range(&files[self.file_index], line));
+            }
+        }
+    }
+
     fn enter_search_input_mode(&mut self) {
         self.search_input_mode = true;
         self.search_input.clear();
@@ -193,6 +243,7 @@ fn move_file(delta: isize, files: &[DiffFileView], app: &mut AppState) -> bool {
     if next_index != app.file_index {
         app.file_index = next_index;
         app.scroll_offset = 0;
+        app.focused_hunk_lines = None;
         return true;
     }
 
@@ -203,14 +254,17 @@ fn move_scroll(delta: isize, files: &[DiffFileView], app: &mut AppState, rows: u
     let max_scroll = max_scroll_for_current_file(files, app, rows);
     let next_offset = (app.scroll_offset as isize + delta).clamp(0, max_scroll as isize) as usize;
     app.scroll_offset = next_offset;
+    app.focused_hunk_lines = None;
 }
 
 fn scroll_to_top(app: &mut AppState) {
     app.scroll_offset = 0;
+    app.focused_hunk_lines = None;
 }
 
 fn scroll_to_bottom(files: &[DiffFileView], app: &mut AppState, rows: u16) {
     app.scroll_offset = max_scroll_for_current_file(files, app, rows);
+    app.focused_hunk_lines = None;
 }
 
 fn move_horizontal(
@@ -240,6 +294,39 @@ fn move_horizontal(
                 .clamp(0, max_offsets.right as isize) as usize;
         }
     }
+}
+
+fn build_hunk_start_lines(file: &DiffFileView) -> Vec<usize> {
+    let mut changed: Vec<usize> = file
+        .left_deleted_line_indexes
+        .iter()
+        .chain(file.right_added_line_indexes.iter())
+        .copied()
+        .collect();
+    changed.sort_unstable();
+    changed.dedup();
+
+    let changed_set: std::collections::HashSet<usize> = changed.iter().copied().collect();
+    changed
+        .into_iter()
+        .filter(|&line| line == 0 || !changed_set.contains(&(line - 1)))
+        .collect()
+}
+
+fn build_hunk_line_range(file: &DiffFileView, hunk_start: usize) -> HashSet<usize> {
+    let mut range = HashSet::new();
+    let max_lines = file.left_lines.len().max(file.right_lines.len());
+    let mut line = hunk_start;
+    while line < max_lines {
+        let is_changed = file.left_deleted_line_indexes.contains(&line)
+            || file.right_added_line_indexes.contains(&line);
+        if !is_changed {
+            break;
+        }
+        range.insert(line);
+        line += 1;
+    }
+    range
 }
 
 fn build_search_match_line_indexes(file: &DiffFileView, query: &str) -> Vec<usize> {
@@ -447,6 +534,14 @@ pub(crate) fn handle_keypress(
             app.jump_to_search_match(files, rows, false);
             KeypressOutcome::default()
         }
+        KeyCode::Char('}') => {
+            app.jump_to_hunk(files, rows, true);
+            KeypressOutcome::default()
+        }
+        KeyCode::Char('{') => {
+            app.jump_to_hunk(files, rows, false);
+            KeypressOutcome::default()
+        }
         KeyCode::Char('r') => {
             let reviewed = app.toggle_current_file_reviewed();
             KeypressOutcome {
@@ -604,6 +699,7 @@ mod tests {
             search_input: String::new(),
             search_match_line_indexes: Vec::new(),
             search_match_index: None,
+            focused_hunk_lines: None,
         };
 
         let first = app.toggle_current_file_reviewed();
